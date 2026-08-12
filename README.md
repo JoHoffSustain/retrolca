@@ -77,6 +77,12 @@ pub.load_decorations(ctx, path)
 
 A full example can be found [here](./examples/pubchem_decorate_flows.py)
 
+**Note:** Since processes are created via the IPC connection while your
+database is open, openLCA's UI may not immediately refresh to show the
+newly generated processes. Close and reopen the database to see them.
+Generated processes appear under the "Retrosynthesis" folder (or the 
+category path > passed to `build()`, e.g. `Retrosynthesis/Inbox`).
+
 ### Retrosynthesis Tool
 
 `retrolca` can build processes from different retrosynthesis tools. At the
