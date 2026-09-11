@@ -111,8 +111,7 @@ other chemical properties from PubChem. If it can find the corresponding data on
 PubChem, the `pubchem` decorator will also add `Chemical amount` as a flow
 property (using the molar mass to calculate the conversion factor).
 
-For example, this script would try to decorate all flows with `manufacture of
-basic chemicals` in their category path with chemical properties from PubChem:
+For example, this script would try to decorate all flows with `manufacture of chemicals and chemical products` in their category path with chemical properties from PubChem:
 
 ```python
 import olca_ipc as ipc
@@ -121,7 +120,7 @@ import retrolca.pubchem as pub
 
 client = ipc.Client()
 ctx, _ = retro.IpcContext.of(client)
-pub.IpcFlowDecorator(ctx).try_all(in_path="manufacture of basic chemicals")
+pub.IpcFlowDecorator(ctx).try_all(in_path="manufacture of chemicals and chemical products")
 ```
 
 Once a database is decorated, you can persist the collected PubChem decorations
@@ -136,9 +135,9 @@ A full example can be found in the [`pubchem_decorate_flows.py`
 example](./examples/pubchem_decorate_flows.py)
 
 Using PubChem is only one possible way to add SMILES codes to chemical products
-in openLCA. You can of course use other data sources for this in the same ways.
+in openLCA. You can of course, use other data sources for this in the same ways.
 `retrolca` just needs to find flows with SMILES codes in order to link them in
-process chains.
+process chains. However, flows with specific descriptions, e.g. hydrochloric acid, without water, in 30% solution state or phosgene, gaseous, are not updated. Those can, however, be added using the "Get from PubChem" function at the flow in most cases, with or without changing the flow name beforehand.
 
 </details>
 
@@ -449,4 +448,5 @@ realistic option), many processes could be created. The intended workflow is for
 you to review and edit these generated processes, link them in product systems
 or move them from some _inbox_ category to another category of the database.
 After this, you can run the [cleanup.jy](examples/cleanup.jy) script directly in
-openLCA to delete the other generated processes.
+openLCA to delete the other generated processes. If you are using the desktop version of
+openLCA, make sure to close and reopen the database to refresh it.
