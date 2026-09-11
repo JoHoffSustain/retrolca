@@ -34,7 +34,7 @@ def main():
 
     # otherwise, collect chemical information on PubChem, decorate the flows,
     # and store the dump
-    pub.IpcFlowDecorator(ctx).try_all(in_path="manufacture of basic chemicals")
+    pub.IpcFlowDecorator(ctx).try_all(in_path="manufacture of chemicals and chemical products")
     pub.dump_decorations(ctx, DUMP)
 
 
