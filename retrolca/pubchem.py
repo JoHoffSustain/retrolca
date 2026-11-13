@@ -263,6 +263,31 @@ def _increment_version(v: str | None) -> str:
     return ".".join([str(i) for i in parts])
 
 
+def cas_of_smiles(smiles_code: str, timeout=30.0) -> list[str]:
+    """Returns the CAS numbers PubChem lists as synonyms for a SMILES code.
+
+    The SMILES code is sent as form data, as it can contain characters like
+    `/` that are not allowed in the URL path.
+    """
+    url = "https://pubchem.ncbi.nlm.nih.gov/rest/pug/compound/smiles/synonyms/JSON"
+    try:
+        resp = requests.post(url, data={"smiles": smiles_code}, timeout=timeout)
+        if resp.status_code != 200:
+            return []
+        data = resp.json()
+        infos = data.get("InformationList", {}).get("Information", [])
+    except Exception as err:
+        log.warning("PubChem CAS lookup failed for %s: %s", smiles_code, err)
+        return []
+    cas_numbers: list[str] = []
+    for info in infos:
+        for syn in info.get("Synonym", []) if isinstance(info, dict) else []:
+            cas = oipc.normalize_cas(syn) if isinstance(syn, str) else None
+            if cas and cas not in cas_numbers:
+                cas_numbers.append(cas)
+    return cas_numbers
+
+
 class IpcFlowDecorator:
     def __init__(self, ctx: oipc.IpcContext):
         self.ctx = ctx

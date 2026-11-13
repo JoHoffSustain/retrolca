@@ -407,6 +407,30 @@ When you create a `ProcessBuilder` it takes the following parameters:
   linked to that process.
 - `naming` (optional, default is a `CIR` instance) - The naming service as
   described above.
+- `yield_` (optional, default is `0.95`) - The reaction yield. The reactant
+  inputs are the stoichiometric amounts divided by the yield, so that an
+  excess of unreacted reactants remains (5.26% of the stoichiometric amount at
+  95% yield). The yield is stored as global parameter `retro_yield` in
+  openLCA and the exchange amounts are formulas of it, so it can be varied in
+  sensitivity analyses. If the parameter already exists in the database, its
+  value is used. Set `yield_=None` to switch the yield losses off.
+- `emission_share` (optional, default is `0.05`) - The share of the excess that
+  is emitted directly (global parameter `retro_em_share`); the rest goes to
+  the waste process. The emissions are mapped to the elementary flows
+  `Emission to air/unspecified` and `Emission to water/unspecified` of the
+  reactant, matched by CAS number (from the reactant flow, the naming
+  service, or PubChem), or by name/synonym together with the formula. If an
+  emission to air exists, the emission is split 50/50 between air and water,
+  otherwise it goes to water. If no elementary flow is found, a new one
+  (emission to water) is created; it has no characterisation factors, so it
+  must be checked in the LCIA.
+- `waste_process` (optional, default is `None`) - The ID of a waste treatment
+  process for the waste part of the excess. If not given, the balancing
+  process is used when it is a waste treatment process.
+
+Note that the balancing flow (`bal_process`) covers the by-products of the
+reaction, e.g. the water of a condensation. It is calculated from the
+stoichiometric amounts only and does not change with the yield.
 
 As shown in the example above, the `build` method is then used to generate the
 process chains. The same builder instance can be used to build process chains

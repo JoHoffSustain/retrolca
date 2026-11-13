@@ -8,7 +8,7 @@ import olca_schema as o
 from rdkit import Chem
 from rdkit.Chem import Draw
 
-from . import oipc, smiles, tool
+from . import losses, oipc, smiles, tool
 from .naming import CIR, NamingService
 from .res import Res, nil, unwrap
 
@@ -25,6 +25,22 @@ def _find_provider(
     return None
 
 
+def _is_waste(ctx: oipc.IpcContext, p: o.TechFlow | None) -> bool:
+    if not p or not p.provider or not p.flow:
+        return False
+    flow_type = p.flow.flow_type
+    if flow_type is None and p.flow.id:
+        # references do not always carry the flow type
+        flow = ctx.client.get(o.Flow, p.flow.id)
+        flow_type = flow.flow_type if flow else None
+        p.flow.flow_type = flow_type
+    return flow_type == o.FlowType.WASTE_FLOW
+
+
+def _provider_name(p: o.TechFlow) -> str:
+    return p.provider.name if p.provider and p.provider.name else "?"
+
+
 class ProcessBuilder:
     def __init__(
         self,
@@ -35,6 +51,9 @@ class ProcessBuilder:
         gen_process: str | None = None,
         bal_process: str | None = None,
         naming: NamingService = CIR(),
+        yield_: float | None = 0.95,
+        emission_share: float = 0.05,
+        waste_process: str | None = None,
     ):
         """Constructs a new process builder.
 
@@ -72,24 +91,65 @@ class ProcessBuilder:
                 The naming service that should be used to translate SMILES codes
                 into names of chemicals. By default CIR is used if not specified
                 otherwise.
+            yield_:
+                The reaction yield, default 0.95. The reactant inputs are the
+                stoichiometric amounts divided by the yield. The value is
+                stored as global parameter `retro_yield` in openLCA and the
+                exchange amounts are formulas of it; if that parameter already
+                exists, its value is used. `None` switches the yield losses
+                off (100% yield, as in earlier versions).
+            emission_share:
+                The share of the yield excess (the unreacted reactants) that
+                is emitted directly, default 0.05; the rest goes to the waste
+                process. Stored as global parameter `retro_em_share`. The
+                emissions are mapped to elementary flows (emission to air and
+                water, unspecified) by CAS number, or by name and formula. If
+                an emission to air exists, the emission is split 50/50 between
+                air and water, otherwise it goes to water. If no flow is found,
+                a new elementary flow (emission to water) without
+                characterisation factors is created.
+            waste_process:
+                An optional ID of a waste treatment process for the waste part
+                of the yield excess. If not given, the balancing process is
+                used when it is a waste treatment process.
         """
         self.ctx = ctx
         log.info("Build provider and flow index")
-        self.providers = oipc.ProviderIndex.of(ctx)
-        self.flows = oipc.FlowIndex.of(ctx)
+        all_flows = ctx.client.get_all(o.Flow)
+        self.providers = oipc.ProviderIndex.of(ctx, all_flows)
+        self.flows = oipc.FlowIndex.of(ctx, all_flows)
         self.tool = tool
         self.max_variants = max_variants
         self.max_levels = max_levels
 
         self.gen_provider: o.TechFlow | None = None
         self.bal_provider: o.TechFlow | None = None
-        if gen_process or bal_process:
+        waste_provider: o.TechFlow | None = None
+        if gen_process or bal_process or waste_process:
             providers = ctx.client.get_providers()
             if gen_process:
                 self.gen_provider = _find_provider(gen_process, providers)
             if bal_process:
                 self.bal_provider = _find_provider(bal_process, providers)
+            if waste_process:
+                waste_provider = _find_provider(waste_process, providers)
+        if waste_provider and not _is_waste(ctx, waste_provider):
+            log.error("The waste process must treat a waste flow; ignored")
+            waste_provider = None
+        if not waste_process and _is_waste(ctx, self.bal_provider):
+            waste_provider = self.bal_provider
         self.naming = naming
+
+        self.yield_model: losses.YieldModel | None = None
+        if yield_ is not None:
+            self.yield_model = losses.YieldModel(
+                ctx,
+                yield_,
+                emission_share,
+                waste_provider,
+                naming,
+                all_flows,
+            )
 
     def expand_process(self, process_id: str, category: str | None):
         process = self.ctx.client.get(o.Process, process_id)
@@ -192,6 +252,7 @@ class ProcessBuilder:
             )
 
             input_mass = 0.0
+            reactants: list[losses.Reactant] = []
             for si in reaction.smiles:
                 smiles_i = smiles.canonicalize(si)
                 provider = self.__resolve_provider(
@@ -227,9 +288,34 @@ class ProcessBuilder:
                 inp = o.new_input(process, flow, amount, self.ctx.kg)
                 inp.flow_property = self.ctx.mass.to_ref()
                 inp.default_provider = provider.provider
+                if self.yield_model:
+                    inp.amount, inp.amount_formula = (
+                        self.yield_model.input_amount(amount)
+                    )
+                    reactants.append(
+                        losses.Reactant(
+                            smiles=smiles_i,
+                            flow=flow,
+                            product_flow=self.flows.data.get(smiles_i),
+                            stoich_amount=amount,
+                        )
+                    )
 
+            # the balancing flow covers the by-products of the reaction
+            # (e.g. water of a condensation); it is calculated from the
+            # stoichiometric amounts only, without the yield excess
             if input_mass > 1.0 and self.bal_provider:
                 self.__add_bal_exchange(process, input_mass - 1.0)
+            if self.yield_model:
+                self.yield_model.add_losses(process, reactants)
+                process.other_properties = process.other_properties or {}
+                process.other_properties["Retrosynthesis-Yield"] = (
+                    self.yield_model.yield_value
+                )
+                process.other_properties["Retrosynthesis-Emission-Share"] = (
+                    self.yield_model.emission_share
+                )
+            self.__check_mass_balance(process)
 
             # Store the process only after its inputs have been resolved and
             # register it as the provider for this product afterwards. If the
@@ -242,7 +328,57 @@ class ProcessBuilder:
             log.info("Stored process %s", process.name)
             processes.append(process)
 
+        if level == 0 and self.yield_model:
+            self.yield_model.log_summary()
         return processes
+
+    def __check_mass_balance(self, process: o.Process) -> None:
+        """Compares the mass of the inputs and outputs of a process.
+
+        The input of the generic production process is not part of the
+        balance. Logs a warning when the balance does not close, which
+        typically means that
+        the retrosynthesis tool did not return all reactants (e.g. hydrogen
+        in reductions) or that no balancing or waste process is set.
+        """
+        gen_id = (
+            self.gen_provider.provider.id
+            if self.gen_provider and self.gen_provider.provider
+            else None
+        )
+        m_in, m_out = 0.0, 0.0
+        for e in process.exchanges or []:
+            if (
+                e.is_input
+                and gen_id
+                and e.default_provider
+                and e.default_provider.id == gen_id
+            ):
+                continue
+            amount = e.amount or 0.0
+            if e.is_input != bool(e.is_avoided_product):
+                m_in += amount
+            else:
+                m_out += amount
+        gap = m_in - m_out
+        if abs(gap) <= 1e-6 * max(m_in, m_out, 1.0):
+            return
+        if gap < 0:
+            hint = (
+                "the reactants are probably incomplete (e.g. hydrogen or "
+                "a reagent not returned by the retrosynthesis tool)"
+            )
+        else:
+            hint = "no balancing or waste process takes up the difference"
+        log.warning(
+            "Mass balance of '%s' does not close: in %.5f kg, out %.5f kg "
+            "(gap %.5f kg); %s",
+            process.name,
+            m_in,
+            m_out,
+            abs(gap),
+            hint,
+        )
 
     def __get_reactions(
         self, smiles_code: str, expanded_reactions: frozenset[str]
@@ -455,8 +591,14 @@ class ProcessBuilder:
         if flow.flow_type == o.FlowType.PRODUCT_FLOW:
             exchange = o.new_input(process, flow, amount, self.ctx.kg)
             exchange.is_avoided_product = True
+            exchange.description = (
+                "Excess Process Mass (by-products) as avoided product"
+            )
         else:
             exchange = o.new_output(process, flow, amount, self.ctx.kg)
+            exchange.description = (
+                "Excess Process Mass (by-products) to waste treatment"
+            )
         exchange.flow_property = self.ctx.mass.to_ref()
         exchange.default_provider = self.bal_provider.provider
 

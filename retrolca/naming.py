@@ -15,6 +15,9 @@ class NamingInfo:
     formula: str | None
     inchi: str | None
     inchi_key: str | None
+    # CAS registry numbers; `None` means not looked up yet, an empty list
+    # that the lookup did not return any CAS number
+    cas: list[str] | None = None
 
 
 class NamingService(Protocol):
@@ -46,7 +49,20 @@ class CIR(NamingService):
             formula=_str(mol.formula),
             inchi=_str(mol.stdinchi),
             inchi_key=_str(mol.stdinchikey),
+            cas=_cas_list(mol),
         )
+
+
+def _cas_list(mol: cirpy.Molecule) -> list[str]:
+    try:
+        cas = mol.cas
+    except Exception:
+        return []
+    if isinstance(cas, str):
+        return [cas]
+    if isinstance(cas, list):
+        return [c for c in cas if isinstance(c, str)]
+    return []
 
 
 def _str(v: Any) -> str | None:
@@ -74,13 +90,16 @@ class CachingNamingService(NamingService):
     @override
     def get_info(self, smiles: str) -> NamingInfo | None:
         key = self.__key_of(smiles)
-        info = self.__lookup(key)
-        if info and info.smiles == smiles:
-            return info
+        cached = self.__lookup(key)
+        if cached and cached.smiles != smiles:
+            cached = None
+        # entries cached before CAS numbers were collected are looked up again
+        if cached and cached.cas is not None:
+            return cached
 
         info = self.service.get_info(smiles)
         if not info:
-            return None
+            return cached
 
         self.__store(key, info)
         return info
