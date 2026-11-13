@@ -428,6 +428,52 @@ When you create a `ProcessBuilder` it takes the following parameters:
   process for the waste part of the excess. If not given, the balancing
   process is used when it is a waste treatment process.
 
+- `boiling_points` (optional, default is `True`) - Looks up the boiling points
+  of the products and reactants on PubChem and stores them in the additional
+  properties of their flows: `Boiling-Point` (°C), `Boiling-Point-Values` and
+  `Boiling-Point-Source`. Only values at 760 mmHg (or without a stated
+  pressure) are used, and the stored value is their median. Flows that already
+  have a `Boiling-Point`, or were already checked, are not changed, so values
+  entered by hand are kept. If PubChem has no value, only
+  `Boiling-Point-Source` is written and the value can be added by hand.
+
+- `loss_model` (optional, default is `"waste"`) - How the unreacted reactants
+  are modelled. `"waste"` is described above. `"wwtp"` follows the
+  stoichiometric estimation approach of Hischier et al. (2005) and Althaus et
+  al. (2007) with an internal wastewater treatment plant: of each reactant
+  input, the share `retro_air_share` (0.2%) is emitted to air as the
+  substance itself, and the rest of the unreacted amount goes to the
+  treatment plant. There, organic substances are degraded with
+  `retro_wwtp_removal` (90%): the carbon is emitted as CO2 (fossil), halogens,
+  sulfur and phosphorus as halide, sulfate and phosphate ions, and the rest
+  is emitted to water as the substance itself together with TOC, DOC, COD
+  (`retro_cod_factor` (0.96) times the theoretical oxygen demand) and BOD5
+  (`retro_bod_factor` (1.0) times COD). Unreacted inorganic acids are
+  neutralized with sodium hydroxide (`naoh_process`, or a provider of a flow
+  named "sodium hydroxide..."), and their anions and the sodium are emitted to
+  water; ions of salts go to water. Nitrogen (from ammonia and from the
+  degraded organic part) is removed with `retro_nh4_removal` (70%) as
+  ammonium-N and `retro_ntot_removal` (50%) as total N; the rest is emitted as
+  ammonium and nitrate. All shares are global parameters, their defaults can
+  be changed with `wwtp_options`, e.g.
+  `wwtp_options={"wwtp_removal": 0.95, "bod_factor": 0.05}`. The elementary
+  flows of CO2, TOC, DOC, COD, BOD5 and the ions are found by name (e.g.
+  "Carbon dioxide, fossil", "COD, Chemical Oxygen Demand", "Chloride",
+  "Sodium I") under the unspecified sub-compartments; missing flows are logged
+  as errors.
+
+  For organic and neutral inorganic reactants, every generated process gets a
+  local parameter `bp_r<n>` with the boiling point of the reactant in °C. It
+  is taken from the flow property `Boiling-Point` (see `boiling_points`), or a
+  built-in value for permanent gases like hydrogen or nitrogen; if no boiling
+  point is known, the value is 9999 and the default distribution above is
+  used. If the boiling point is below `retro_bp_gas` (default -100 °C), the
+  share `retro_gas_air_share` (default 1) of the unreacted amount is emitted
+  to air instead of going to the treatment plant. Acids, ammonia and salts
+  are treated as dissolved and do not get a boiling point parameter. The
+  amounts are `if` formulas of the parameter, so a boiling point entered
+  later in openLCA updates them.
+
 Note that the balancing flow (`bal_process`) covers the by-products of the
 reaction, e.g. the water of a condensation. It is calculated from the
 stoichiometric amounts only and does not change with the yield.

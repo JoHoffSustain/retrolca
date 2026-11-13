@@ -8,7 +8,7 @@ import olca_schema as o
 from rdkit import Chem
 from rdkit.Chem import Draw
 
-from . import losses, oipc, smiles, tool
+from . import boiling, losses, oipc, smiles, tool, wwtp
 from .naming import CIR, NamingService
 from .res import Res, nil, unwrap
 
@@ -41,6 +41,26 @@ def _provider_name(p: o.TechFlow) -> str:
     return p.provider.name if p.provider and p.provider.name else "?"
 
 
+def _naoh_provider(
+    ctx: oipc.IpcContext, process_id: str | None
+) -> o.TechFlow | None:
+    providers = ctx.client.get_providers()
+    if process_id:
+        return _find_provider(process_id, providers)
+    candidates = [
+        p for p in providers
+        if p.flow
+        and p.flow.name
+        and p.flow.name.lower().startswith("sodium hydroxide")
+    ]
+    if not candidates:
+        return None
+    p = ctx.provider_selector.select(candidates)
+    if p and p.provider:
+        log.info("Using '%s' to neutralize unreacted acids", p.provider.name)
+    return p
+
+
 class ProcessBuilder:
     def __init__(
         self,
@@ -54,6 +74,10 @@ class ProcessBuilder:
         yield_: float | None = 0.95,
         emission_share: float = 0.05,
         waste_process: str | None = None,
+        boiling_points: bool = True,
+        loss_model: str = "waste",
+        wwtp_options: dict[str, float] | None = None,
+        naoh_process: str | None = None,
     ):
         """Constructs a new process builder.
 
@@ -112,6 +136,29 @@ class ProcessBuilder:
                 An optional ID of a waste treatment process for the waste part
                 of the yield excess. If not given, the balancing process is
                 used when it is a waste treatment process.
+            loss_model:
+                How the unreacted reactants (yield excess) are modelled:
+                "waste" (default) sends the excess to the waste process and
+                emits the share `emission_share` directly; "wwtp" models an
+                internal wastewater treatment plant (air share, degradation
+                to CO2, ions, nitrogen, TOC/DOC/COD/BOD5), see `retrolca.wwtp`.
+            wwtp_options:
+                Optional default values of the "wwtp" model: air_share
+                (0.002), wwtp_removal (0.9), nh4_removal (0.7), ntot_removal
+                (0.5), cod_factor (0.96), bod_factor (1.0). They are stored as
+                global parameters; existing parameters keep their values.
+            naoh_process:
+                An optional ID of a sodium hydroxide production process, used
+                in the "wwtp" model to neutralize unreacted acids. If not
+                given, a provider of a flow named "sodium hydroxide..." is
+                searched.
+            boiling_points:
+                If true (default), the boiling points of the products and
+                reactants are looked up on PubChem and stored in the
+                additional properties of their flows (`Boiling-Point` in °C,
+                with `Boiling-Point-Source` and `Boiling-Point-Values`). Flows
+                that already have a boiling point or were already checked are
+                not changed, so values entered by hand are kept.
         """
         self.ctx = ctx
         log.info("Build provider and flow index")
@@ -139,9 +186,22 @@ class ProcessBuilder:
         if not waste_process and _is_waste(ctx, self.bal_provider):
             waste_provider = self.bal_provider
         self.naming = naming
+        self.boiling_points = boiling_points
+        self.__bp_checked: set[str] = set()
 
         self.yield_model: losses.YieldModel | None = None
-        if yield_ is not None:
+        if yield_ is not None and loss_model == "wwtp":
+            self.yield_model = wwtp.WwtpModel(
+                ctx,
+                yield_,
+                naming,
+                all_flows,
+                naoh_provider=_naoh_provider(ctx, naoh_process),
+                **(wwtp_options or {}),
+            )
+        elif yield_ is not None:
+            if loss_model != "waste":
+                raise ValueError(f"unknown loss model: {loss_model}")
             self.yield_model = losses.YieldModel(
                 ctx,
                 yield_,
@@ -237,6 +297,7 @@ class ProcessBuilder:
         mm_prod = self.ctx.molar_mass_of(ref_flow)
         if not mm_prod:
             return []
+        self.__ensure_boiling_point(smiles_code, ref_flow)
         reactions = self.__get_reactions(smiles_code, expanded_reactions)
         if len(reactions) == 0:
             return []
@@ -285,6 +346,9 @@ class ProcessBuilder:
                 # m_inp = mm_inp / mm_out
                 amount = mm_react / mm_prod
                 input_mass += amount
+                self.__ensure_boiling_point(
+                    smiles_i, self.flows.data.get(smiles_i)
+                )
                 inp = o.new_input(process, flow, amount, self.ctx.kg)
                 inp.flow_property = self.ctx.mass.to_ref()
                 inp.default_provider = provider.provider
@@ -315,7 +379,7 @@ class ProcessBuilder:
                 process.other_properties["Retrosynthesis-Emission-Share"] = (
                     self.yield_model.emission_share
                 )
-            self.__check_mass_balance(process)
+            self.__check_mass_balance(process, input_mass)
 
             # Store the process only after its inputs have been resolved and
             # register it as the provider for this product afterwards. If the
@@ -332,50 +396,55 @@ class ProcessBuilder:
             self.yield_model.log_summary()
         return processes
 
-    def __check_mass_balance(self, process: o.Process) -> None:
-        """Compares the mass of the inputs and outputs of a process.
+    def __ensure_boiling_point(self, smiles_code: str, flow: o.Flow | None):
+        if not self.boiling_points or not flow:
+            return
+        if smiles_code in self.__bp_checked:
+            return
+        self.__bp_checked.add(smiles_code)
+        if boiling.stored_value(flow) is not None or boiling.was_checked(flow):
+            return
+        bp = boiling.from_pubchem(smiles_code)
+        boiling.store(flow, bp)
+        self.ctx.client.put(flow)
+        if bp:
+            log.info(
+                "Boiling point of '%s': %.2f °C (%s)",
+                flow.name,
+                bp.value,
+                bp.source,
+            )
+        else:
+            log.info("No boiling point found on PubChem for '%s'", flow.name)
 
-        The input of the generic production process is not part of the
-        balance. Logs a warning when the balance does not close, which
-        typically means that
-        the retrosynthesis tool did not return all reactants (e.g. hydrogen
-        in reductions) or that no balancing or waste process is set.
+    def __check_mass_balance(self, process: o.Process, stoich_mass: float):
+        """Checks the stoichiometric mass balance of a generated process.
+
+        Per kg of product, the stoichiometric reactant mass minus 1 kg is the
+        mass of the by-products, which is linked to the balancing process. A
+        reactant mass below 1 kg means that the reaction is incomplete, which
+        typically means that the retrosynthesis tool did not return all
+        reactants (e.g. hydrogen in reductions). The yield losses are not part
+        of this check, as they balance by construction (waste model) or are
+        transformed in the wastewater treatment (wwtp model).
         """
-        gen_id = (
-            self.gen_provider.provider.id
-            if self.gen_provider and self.gen_provider.provider
-            else None
-        )
-        m_in, m_out = 0.0, 0.0
-        for e in process.exchanges or []:
-            if (
-                e.is_input
-                and gen_id
-                and e.default_provider
-                and e.default_provider.id == gen_id
-            ):
-                continue
-            amount = e.amount or 0.0
-            if e.is_input != bool(e.is_avoided_product):
-                m_in += amount
-            else:
-                m_out += amount
-        gap = m_in - m_out
-        if abs(gap) <= 1e-6 * max(m_in, m_out, 1.0):
+        gap = stoich_mass - 1.0
+        if abs(gap) <= 1e-6:
             return
         if gap < 0:
             hint = (
                 "the reactants are probably incomplete (e.g. hydrogen or "
                 "a reagent not returned by the retrosynthesis tool)"
             )
+        elif not self.bal_provider:
+            hint = "no balancing process takes up the by-products"
         else:
-            hint = "no balancing or waste process takes up the difference"
+            return
         log.warning(
-            "Mass balance of '%s' does not close: in %.5f kg, out %.5f kg "
-            "(gap %.5f kg); %s",
+            "Mass balance of '%s' does not close: reactants %.5f kg, "
+            "product 1 kg (gap %.5f kg); %s",
             process.name,
-            m_in,
-            m_out,
+            stoich_mass,
             abs(gap),
             hint,
         )

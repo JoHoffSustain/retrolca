@@ -343,6 +343,14 @@ class ElementaryFlowIndex:
         flow, _ = self.find_match(comp, smiles_code, cas_numbers, names, formula)
         return flow
 
+    def find_name(self, comp: str, names: list[str]) -> o.Flow | None:
+        """Finds a flow by one of the given names or synonyms (in order)."""
+        for name in names:
+            n = normalize_name(name)
+            if n and (flows := self.by_name.get((n, comp))):
+                return flows[0]
+        return None
+
     def find_match(
         self,
         comp: str,
